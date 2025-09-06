@@ -13,9 +13,6 @@ caps = {
     "platformName": "Android",
     "automationName": "UiAutomator2",
     "udid": ADB,  # 云手机 ADB 地址
-    # "app": r"C:\path\to\your.apk",       # 二选一：给 app 路径
-    # "appPackage": "com.demo.app",        # 或者给包名 + Activity
-    # "appActivity": ".MainActivity",
     "newCommandTimeout": 300,
     "autoGrantPermissions": True,
     "unicodeKeyboard": True,
