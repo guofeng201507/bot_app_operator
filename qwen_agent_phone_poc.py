@@ -7,6 +7,8 @@ from appium import webdriver
 
 from PIL import Image
 
+from dashscope import MultiModalConversation
+
 # ---------- 环境 ----------
 load_dotenv()
 ADB = os.getenv("ADB_HOST_PORT")
@@ -141,35 +143,98 @@ Only JSON. Be concise and robust to language differences in UI.
 """
 
 
+def _png_to_jpeg_dataurl(png_bytes, max_side=1024, quality=85) -> str:
+    """压缩 PNG → JPEG 并返回 data URL 字符串"""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    w, h = img.size
+    s = min(1.0, max_side / max(w, h))
+    if s < 1.0:
+        img = img.resize((int(w * s), int(h * s)))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _extract_text(resp_dict: dict) -> str:
+    """统一从 dict 里提取文本，按优先级兜底，兼容 content 为 list 的返回"""
+    # 1) output_text
+    t = resp_dict.get("output_text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    # 2) output.text / output.answer
+    out = resp_dict.get("output")
+    if isinstance(out, dict):
+        for k in ("text", "answer"):
+            v = out.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+        # 2.1) 兼容：output.choices[0].message.content (list 或 str)
+        choices = out.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message") or {}
+            content = msg.get("content")
+            # 可能是字符串
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            # 更常见：是 [{ "text": "..."}, {"text": "..."}]
+            if isinstance(content, list) and content:
+                parts = []
+                for seg in content:
+                    if isinstance(seg, dict):
+                        # 多模态还有 {"image": "..."} 之类，这里只取文本段
+                        if "text" in seg and isinstance(seg["text"], str):
+                            parts.append(seg["text"])
+                merged = "\n".join(parts).strip()
+                if merged:
+                    return merged
+
+    # 3) OpenAI 风格：choices[0].message.content（顶层）
+    choices = resp_dict.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = (choices[0].get("message") or {})
+        v = msg.get("content")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # 4) 实在没有
+    raise RuntimeError(f"Unexpected response shape: keys={list(resp_dict.keys())}, resp={resp_dict}")
+
+
 def call_qwen(prompt_text: str, img_png: bytes) -> str:
-    if not QWEN_API_KEY:
-        raise RuntimeError("QWEN_API_KEY not set")
+    data_url = _png_to_jpeg_dataurl(img_png)
 
-    img_payload = _encode_image_for_api(img_png)
+    # SDK 使用 messages（OpenAI 风格），兼容多模态
+    messages = [{
+        "role": "user",
+        "content": [
+            {"text": prompt_text},
+            {"image": data_url}
+        ]
+    }]
 
-    # qwen_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-    qwen_url = QWEN_URL
-    headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+    # 模型务必用多模态：qwen-vl-plus 或 qwen2-vl-72b-instruct
+    rsp = MultiModalConversation.call(
+        model="qwen-vl-plus",
+        messages=messages,
+        api_key=QWEN_API_KEY,
+        result_format="json"  # 返回 JSON 字符串
+    )
 
-    payload = {
-        "model": QWEN_MODEL,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt_text},
-                {"type": "image", "source": {"type": "base64", **img_payload}}
-            ]
-        }],
-        "parameters": {"result_format": "json"}
-    }
-    r = requests.post(qwen_url, headers=headers, data=json.dumps(payload), timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    # 兼容不同返回结构
-    txt = data.get("output", {}).get("text") or (data.get("choices", [{}])[0].get("message", {}).get("content"))
-    if not txt:
-        raise RuntimeError(f"Unexpected model response: {data}")
-    return txt.strip().strip("```json").strip("```").strip()
+    # 统一转为 dict 再解析，避免属性/下标差异导致的 KeyError
+    try:
+        resp = json.loads(rsp.to_json())  # DashScopeResponse -> dict
+    except Exception:
+        # 万一不是 DashScopeResponse，而是本来就是 dict
+        resp = rsp if isinstance(rsp, dict) else {"raw": repr(rsp)}
+
+    if resp.get("status_code") and resp["status_code"] != 200:
+        raise RuntimeError(
+            f"DashScope SDK error: {resp.get('code')} <{resp.get('status_code')}> {resp.get('message')} {resp.get('request_id')}")
+
+    text = _extract_text(resp)
+    return text.strip().strip("```").replace("```json","").strip()
 
 
 def think_action(goal: str, screenshot: bytes) -> Dict[str, Any]:
